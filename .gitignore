@@ -1,0 +1,65 @@
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# =============================================================================
+# Data Science & Notebooks
+# =============================================================================
+# Jupyter artifacts
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Large / raw data files — download separately via PhysioNet
+data/*.edf
+data/*.edf.gz
+data/*.csv
+data/*.xlsx
+data/*.parquet
+data/*.h5
+data/*.hdf5
+
+# Serialized model objects (can be large)
+outputs/models/*.pkl
+outputs/models/*.joblib
+
+# =============================================================================
+# IDE & OS
+# =============================================================================
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+desktop.ini
+
+# =============================================================================
+# Environment & secrets
+# =============================================================================
+.env
+.env.*
+*.pem
+*.key
+
+# =============================================================================
+# Testing & coverage
+# =============================================================================
+.pytest_cache/
+.coverage
+htmlcov/
