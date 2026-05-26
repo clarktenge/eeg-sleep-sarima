@@ -63,6 +63,3 @@ desktop.ini
 .pytest_cache/
 .coverage
 htmlcov/
-
-# Cowork session files
-.claude/
