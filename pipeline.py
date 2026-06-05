@@ -1,27 +1,34 @@
 # =============================================================================
-# Rhythms of the Sleeping Brain: SARIMA Modeling & Spectral Analysis
-# EEG Alpha Power Across Human Sleep Cycles
-# PhysioNet Sleep-EDF Database — Fpz-Cz Channel
+# Rhythms of the Sleeping Brain
+# ARIMA Modeling & Spectral Analysis of EEG Alpha Power Across Human Sleep Cycles
+# PhysioNet Sleep-EDF Database (Kemp et al., 2000) -- channel EEG Fpz-Cz
+#
+# Author : Clark Enge  (clarkenge@ucsb.edu)
+# Course : PSTAT W 274 -- Time Series Analysis
+#
+# Headless, end-to-end script. Reproduces every figure in outputs/figures/ and
+# prints every number I quote in the report. Everything here is done by hand --
+# no auto_arima, no checkresiduals, no automated model search.
 # =============================================================================
+
+import os
+import warnings
 
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")   # headless — no display required
+matplotlib.use("Agg")            # headless backend -- no display needed
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import seaborn as sns
 from scipy import signal
 from scipy.stats import probplot, shapiro, kstest
 from scipy.special import comb
-import statsmodels.api as sm
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.ar_model import AutoReg          # replaces deprecated sm.tsa.AR
-from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.stattools import adfuller, acf, pacf
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.stats.diagnostic import acorr_ljungbox
-import warnings
-import os
 
 warnings.filterwarnings("ignore")
 sns.set_theme(style="whitegrid", palette="muted")
@@ -31,12 +38,16 @@ plt.rcParams.update({"figure.dpi": 120, "axes.titlesize": 12})
 EDF_FILE   = "data/SC4001E0-PSG.edf"
 HYPNO_FILE = "data/SC4001EC-Hypnogram.edf"
 
-EPOCH_SEC    = 30
-ALPHA_LO     = 8.0
-ALPHA_HI     = 13.0
-FS           = 100
-TRAIN_FRAC   = 0.80
-S            = 18      # candidate seasonal period in epochs (~9 min); revisit after ACF/PACF
+# --- Constants ---
+EPOCH_SEC  = 30          # standard PSG scoring epoch (seconds)
+ALPHA_LO   = 8.0         # alpha band lower edge (Hz)
+ALPHA_HI   = 13.0        # alpha band upper edge (Hz)
+FS         = 100         # sampling rate of the recording (Hz)
+TRAIN_FRAC = 0.80
+# Ultradian NREM-REM cycle is ~90 min = 180 epochs. I keep this only as a label
+# for the spectral plots. I do NOT use it as a SARIMA seasonal period -- Section 6
+# shows seasonal differencing at this lag over-differences the series.
+S_ULTRADIAN = 180
 
 FIGURES_DIR = "outputs/figures"
 os.makedirs(FIGURES_DIR, exist_ok=True)
@@ -48,12 +59,12 @@ os.makedirs("outputs/models", exist_ok=True)
 # =============================================================================
 def load_edf_channel(edf_path: str, channel: str = "EEG Fpz-Cz") -> tuple:
     """
-    Load a single EEG channel from an EDF file via MNE and resample to FS.
+    Load one EEG channel from an EDF file with MNE and resample to FS if needed.
     Returns (raw_signal: np.ndarray, sfreq: float).
     """
     import mne
     raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
-    raw.pick_channels([channel])
+    raw.pick(channel)                       # pick_channels() is deprecated in MNE >= 1.7
     if raw.info["sfreq"] != FS:
         raw.resample(FS, npad="auto")
     data, _ = raw[:]
@@ -66,8 +77,9 @@ def load_edf_channel(edf_path: str, channel: str = "EEG Fpz-Cz") -> tuple:
 def bandpass_filter(signal_arr: np.ndarray, lo: float, hi: float,
                     fs: float, order: int = 4) -> np.ndarray:
     """
-    Zero-phase 4th-order Butterworth band-pass filter using second-order
-    sections (sosfiltfilt) to avoid phase distortion on short EEG epochs.
+    Zero-phase 4th-order Butterworth band-pass via second-order sections.
+    Zero-phase (sosfiltfilt) matters on 30 s epochs: a causal filter would add a
+    phase lag that distorts the per-epoch power estimate.
     """
     nyq = 0.5 * fs
     sos = signal.butter(order, [lo / nyq, hi / nyq], btype="band", output="sos")
@@ -75,30 +87,28 @@ def bandpass_filter(signal_arr: np.ndarray, lo: float, hi: float,
 
 
 def compute_epoch_alpha_power(raw_signal: np.ndarray, fs: float,
-                               epoch_sec: int = EPOCH_SEC,
-                               lo: float = ALPHA_LO,
-                               hi: float = ALPHA_HI) -> np.ndarray:
+                              epoch_sec: int = EPOCH_SEC,
+                              lo: float = ALPHA_LO,
+                              hi: float = ALPHA_HI) -> np.ndarray:
     """
-    Construct the univariate time series X_t of alpha-band power.
+    Build the univariate series X_t of alpha-band power, one value per epoch.
 
-    For each 30-second epoch t:
-      1. Slice N_ep = fs * epoch_sec samples
-      2. Band-pass filter to [lo, hi] Hz
-      3. Welch PSD: 2-second Hann windows, 50% overlap
-      4. Integrate PSD over [lo, hi]:  X_t = trapz(Pxx[alpha], f[alpha])
+    For each 30 s epoch t:
+      1. slice N = fs * epoch_sec samples
+      2. band-pass filter to [lo, hi] Hz
+      3. Welch PSD with 2 s Hann windows, 50% overlap
+      4. integrate the PSD over [lo, hi]:  X_t = trapz(Pxx[alpha], f[alpha])
     """
     N_ep = int(fs * epoch_sec)
     n_epochs = len(raw_signal) // N_ep
     alpha_power = np.empty(n_epochs)
-
     for t in range(n_epochs):
-        seg = raw_signal[t * N_ep : (t + 1) * N_ep]
+        seg = raw_signal[t * N_ep:(t + 1) * N_ep]
         filt = bandpass_filter(seg, lo, hi, fs)
         freqs, pxx = signal.welch(filt, fs=fs, nperseg=int(fs * 2),
                                   window="hann", scaling="density")
-        alpha_mask = (freqs >= lo) & (freqs <= hi)
-        alpha_power[t] = np.trapz(pxx[alpha_mask], freqs[alpha_mask])
-
+        mask = (freqs >= lo) & (freqs <= hi)
+        alpha_power[t] = np.trapezoid(pxx[mask], freqs[mask])   # np.trapz renamed in NumPy 2.x
     return alpha_power
 
 
@@ -109,10 +119,11 @@ print("Extracting alpha power per epoch...")
 X_raw = compute_epoch_alpha_power(raw_eeg, sfreq)
 X_t = pd.Series(X_raw, name="alpha_power_uV2")
 print(f"Series length: {len(X_t)} epochs  (~{len(X_t) * EPOCH_SEC / 3600:.1f} hours)")
+print(f"Range: [{X_t.min():.3e}, {X_t.max():.3e}]  mean={X_t.mean():.3e}  skew={X_t.skew():.3f}")
 
 
 # =============================================================================
-# 3. TRAIN / TEST SPLIT  (80 / 20)
+# 3. TRAIN / TEST SPLIT  (80 / 20, no shuffling)
 # =============================================================================
 split_idx = int(len(X_t) * TRAIN_FRAC)
 train = X_t.iloc[:split_idx].copy()
@@ -127,27 +138,28 @@ def plot_eda(series: pd.Series, title_prefix: str = "Training") -> None:
     fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=False)
 
     axes[0].plot(series.values, color="#4C72B0", lw=0.9)
-    axes[0].set_title(f"{title_prefix} Series — Alpha Power (μV²/Hz)")
+    axes[0].set_title(f"{title_prefix} Series - Alpha Power")
     axes[0].set_xlabel("Epoch (30 s)")
-    axes[0].set_ylabel("Power")
+    axes[0].set_ylabel("Power (uV^2/Hz)")
 
-    roll = series.rolling(window=6)
+    roll = series.rolling(window=6)          # 6 epochs = 3 min
     axes[1].plot(series.values, alpha=0.4, color="#4C72B0", lw=0.7, label="Raw")
     axes[1].plot(roll.mean().values, color="#C44E52", lw=1.5, label="Rolling mean (6 ep)")
     axes[1].plot(roll.std().values,  color="#55A868", lw=1.5, label="Rolling std (6 ep)")
-    axes[1].set_title("Rolling Statistics — Trend & Variance Inspection")
+    axes[1].set_title("Rolling Statistics - Trend & Variance Inspection")
     axes[1].set_xlabel("Epoch")
     axes[1].legend(fontsize=9)
 
     axes[2].hist(series.dropna(), bins=40, color="#4C72B0", edgecolor="white", alpha=0.8)
     axes[2].set_title("Marginal Distribution of Alpha Power")
-    axes[2].set_xlabel("Power (μV²/Hz)")
+    axes[2].set_xlabel("Power (uV^2/Hz)")
     axes[2].set_ylabel("Count")
 
     plt.tight_layout()
     plt.savefig(f"{FIGURES_DIR}/eda_plots.png", bbox_inches="tight")
     plt.close()
     print(f"Saved: {FIGURES_DIR}/eda_plots.png")
+
 
 plot_eda(train)
 
@@ -157,20 +169,20 @@ plot_eda(train)
 # =============================================================================
 def log_transform(series: pd.Series) -> pd.Series:
     """
-    Variance-stabilising log transform: Y_t = log(X_t + ε)
-    ε = 1e-6 * median(X_t) guards against zero-power epochs.
-    Appropriate when Var(X_t) is roughly proportional to E[X_t].
+    Variance-stabilising log transform: Y_t = log(X_t + eps),
+    eps = 1e-6 * median(X_t) guards against log(0). The rolling-std plot tracks the
+    rolling mean, so variance grows with level -- the multiplicative case the log fixes.
     """
     eps = 1e-6 * series.median()
     return np.log(series + eps)
 
 
 def manual_difference(series: pd.Series, d: int = 1,
-                       D: int = 0, S: int = 0) -> pd.Series:
+                      D: int = 0, S: int = 0) -> pd.Series:
     """
-    Apply regular differencing (order d) then seasonal differencing (order D, period S).
-    Regular:  ∇^d Y_t  = (1 - B)^d Y_t
-    Seasonal: ∇_S^D Y_t = (1 - B^S)^D Y_t
+    Regular differencing (order d) then seasonal differencing (order D, period S).
+    Regular:  (1 - B)^d Y_t
+    Seasonal: (1 - B^S)^D Y_t
     """
     out = series.copy()
     for _ in range(d):
@@ -184,434 +196,389 @@ def manual_difference(series: pd.Series, d: int = 1,
 def run_adf_test(series: pd.Series, label: str = "") -> dict:
     """
     Augmented Dickey-Fuller test.
-    NOTE: ADF only tests for a unit root in the AR part (stochastic trend).
-    It does NOT detect other forms of non-stationarity such as structural breaks,
-    heteroscedasticity, or deterministic seasonality. Interpret accordingly.
+    Caveat I keep front of mind: ADF only tests for a UNIT ROOT in the AR part
+    (a stochastic trend). It says nothing about seasonality, variance changes, or
+    structural breaks -- a series can "pass" ADF and still be non-stationary.
     H0: unit root present (non-stationary). Reject if p < 0.05.
     """
     result = adfuller(series.dropna(), autolag="AIC")
-    out = {
-        "label"     : label,
-        "adf_stat"  : result[0],
-        "p_value"   : result[1],
-        "n_lags"    : result[2],
-        "n_obs"     : result[3],
-        "crit_1pct" : result[4]["1%"],
-        "crit_5pct" : result[4]["5%"],
-        "crit_10pct": result[4]["10%"],
-    }
-    print(f"\nADF [{label}]:")
-    print(f"  Stat       = {out['adf_stat']:.4f}")
-    print(f"  p-value    = {out['p_value']:.4f}")
-    print(f"  Lags used  = {out['n_lags']}")
-    print(f"  Crit 1%    = {out['crit_1pct']:.4f}")
-    print(f"  Crit 5%    = {out['crit_5pct']:.4f}")
-    print(f"  Crit 10%   = {out['crit_10pct']:.4f}")
-    stationary = out["p_value"] < 0.05
-    print(f"  → {'STATIONARY' if stationary else 'NON-STATIONARY'} at 5% level")
+    out = {"label": label, "adf_stat": result[0], "p_value": result[1],
+           "n_lags": result[2], "n_obs": result[3],
+           "crit_5pct": result[4]["5%"]}
+    print(f"ADF [{label}]: stat={out['adf_stat']:+.4f}  p={out['p_value']:.4g}  "
+          f"lags={out['n_lags']}  crit5%={out['crit_5pct']:.3f}  "
+          f"-> {'STATIONARY' if out['p_value'] < 0.05 else 'NON-STATIONARY'}")
     return out
 
 
-# Execute stationarity pipeline
 eps_val = 1e-6 * X_t.median()
 Y_t = log_transform(train)
-run_adf_test(Y_t, "log(X_t)")
-
 W_t = manual_difference(Y_t, d=1)
-run_adf_test(W_t, "∇ log(X_t)")
 
-W_t_s = manual_difference(Y_t, d=1, D=1, S=S)
-run_adf_test(W_t_s, f"∇∇_{S} log(X_t)")
+print("\n--- Stationarity ---")
+adf_log  = run_adf_test(Y_t, "log(X_t)")
+adf_diff = run_adf_test(W_t, "d1 log(X_t)")
 
 
 # =============================================================================
-# 6. ACF & PACF PLOTS
+# 6. SEASONAL HEURISTIC TEST  (why I do NOT use a SARIMA seasonal term)
+# -----------------------------------------------------------------------------
+# Physiology says the NREM-REM cycle is ~90 min = 180 epochs, so the obvious move
+# is a seasonal SARIMA at S = 180 (or S = 18 ~ 9 min). I tested that heuristic and
+# rejected it on three independent grounds:
+#
+#   (1) OVER-DIFFERENCING: seasonal differencing should REDUCE variance. At both
+#       S = 18 and S = 180 it INCREASES variance vs. the plain first difference,
+#       the textbook signature of over-differencing (printed below).
+#   (2) NO SEASONAL SIGNATURE: the ACF/PACF of d1 log(X_t) has no significant
+#       spike at lag 18, 147, 180 or 189 (all inside the +-1.96/sqrt(n) band).
+#   (3) INFEASIBILITY: a state-space SARIMA with S = 180 has a ~180-dim state and
+#       does not converge in any reasonable time on this series.
+#
+# Conclusion: model the mean with a non-seasonal ARIMA, and treat the ultradian
+# rhythm as a SPECTRAL finding (Section 11) rather than a differencing operation.
 # =============================================================================
-def plot_acf_pacf(series: pd.Series, lags: int = 60,
-                   title: str = "Differenced Series",
-                   fname: str = "acf_pacf.png") -> None:
+print("\n--- Seasonal heuristic: over-differencing check ---")
+var_log = Y_t.var()
+var_d1  = W_t.var()
+print(f"  var[log(X_t)]          = {var_log:.5f}")
+print(f"  var[d1 log(X_t)]       = {var_d1:.5f}")
+for S in (18, S_ULTRADIAN):
+    var_sd = manual_difference(Y_t, d=1, D=1, S=S).var()
+    flag = "INCREASED -> over-differencing" if var_sd > var_d1 else "reduced -> justified"
+    print(f"  var[d1 D1_S{S:<3} log(X_t)] = {var_sd:.5f}   ({flag})")
+
+# Quick numeric scan of ACF/PACF at candidate seasonal lags
+W_full = W_t.dropna()
+ci_band = 1.96 / np.sqrt(len(W_full))
+a_seas = acf(W_full, nlags=200)
+p_seas = pacf(W_full, nlags=200, method="ywm")
+print(f"  seasonal-lag ACF/PACF (95% band = +-{ci_band:.3f}):")
+for k in (18, 147, 180, 189):
+    print(f"    lag {k:>3}: ACF={a_seas[k]:+.3f}  PACF={p_seas[k]:+.3f}")
+
+
+# =============================================================================
+# 7. ACF & PACF -- MODEL IDENTIFICATION
+# =============================================================================
+def plot_acf_pacf(series: pd.Series, lags: int = 40,
+                  title: str = "", fname: str = "acf_pacf.png") -> None:
     """
-    Side-by-side ACF and PACF with 95% confidence bands.
-    Visual identification rules:
-      - ACF cuts off at q, PACF tails off → MA(q)
-      - PACF cuts off at p, ACF tails off → AR(p)
-      - Both tail off → mixed ARMA(p,q)
-      - Spikes at multiples of S → seasonal SAR/SMA terms
+    Side-by-side ACF and PACF with 95% bands.
+    Identification rules I apply by eye:
+      ACF cuts off at q, PACF tails off -> MA(q)
+      PACF cuts off at p, ACF tails off -> AR(p)
+      both tail off                     -> mixed ARMA(p,q)
     """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 4))
     plot_acf(series.dropna(),  lags=lags, alpha=0.05, ax=ax1,
-             title=f"ACF — {title}", zero=False)
+             title=f"ACF - {title}", zero=False)
     plot_pacf(series.dropna(), lags=lags, alpha=0.05, ax=ax2,
-              title=f"PACF — {title}", zero=False, method="ywm")
+              title=f"PACF - {title}", zero=False, method="ywm")
     plt.tight_layout()
     plt.savefig(f"{FIGURES_DIR}/{fname}", bbox_inches="tight")
     plt.close()
     print(f"Saved: {FIGURES_DIR}/{fname}")
 
-plot_acf_pacf(W_t_s, lags=60, title=f"∇∇_{S} log(X_t)", fname="acf_pacf.png")
 
-# Also plot the simply differenced series (no seasonal) for comparison
-plot_acf_pacf(W_t, lags=60, title="∇ log(X_t)", fname="acf_pacf_nodiff.png")
+# d1 log(X_t): ACF cuts off after lag 1, PACF tails off -> first guess MA(1) = ARIMA(0,1,1)
+plot_acf_pacf(W_t, lags=40, title="d1 log(X_t)", fname="acf_pacf.png")
 
 
 # =============================================================================
-# 7. MANUAL AICc
+# 8. AICc + SARIMA FITTING
 # =============================================================================
 def compute_aicc(log_likelihood: float, n_params: int, n_obs: int) -> float:
     """
-    Corrected Akaike Information Criterion for small samples.
-        AIC  = -2 * ℓ(θ̂) + 2k
-        AICc = AIC + 2k(k+1) / (n - k - 1)
-    k = number of free parameters (including σ²), n = effective observations.
-    Preferred over AIC when n/k < 40.
+    AICc = -2 l(theta) + 2k + 2k(k+1)/(n-k-1).  k counts sigma^2.
+    Preferred over AIC when n/k is not large.
     """
     if n_obs - n_params - 1 <= 0:
-        raise ValueError(f"Model overparameterized: n={n_obs}, k={n_params}")
+        raise ValueError(f"Overparameterised: n={n_obs}, k={n_params}")
     aic  = -2.0 * log_likelihood + 2.0 * n_params
     corr = (2.0 * n_params * (n_params + 1)) / (n_obs - n_params - 1)
     return aic + corr
 
 
-# =============================================================================
-# 8. SARIMA FITTING
-# =============================================================================
-def fit_sarima(endog: pd.Series, order: tuple, seasonal_order: tuple,
-               label: str) -> dict:
+def fit_arima(endog: pd.Series, order: tuple, label: str,
+              verbose: bool = True) -> dict:
     """
-    Fit a SARIMAX model and report statistics manually.
-    Model: Φ_P(B^S) φ_p(B) ∇^d ∇_S^D Y_t = Θ_Q(B^S) θ_q(B) ε_t
-    No automated diagnostics — raw parameter access only.
+    Fit a (non-seasonal) ARIMA via SARIMAX and report stats by hand.
+    Model: phi_p(B) (1-B)^d Y_t = theta_q(B) eps_t,  eps_t ~ WN(0, sigma^2).
     """
-    model  = SARIMAX(endog, order=order, seasonal_order=seasonal_order,
-                     enforce_stationarity=True, enforce_invertibility=True,
-                     trend="n")
+    model  = SARIMAX(endog, order=order, seasonal_order=(0, 0, 0, 0),
+                     trend="n", enforce_stationarity=True, enforce_invertibility=True)
     result = model.fit(disp=False, maxiter=200)
-
     n_obs    = result.nobs
-    n_params = result.df_model + 1   # +1 for σ²
-    ll       = result.llf
-    aicc_val = compute_aicc(ll, n_params, n_obs)
-
-    print(f"\n{'='*60}")
-    print(f"  {label}  SARIMA{order}x{seasonal_order}")
-    print(f"  Log-likelihood : {ll:.4f}")
-    print(f"  AIC            : {result.aic:.4f}")
-    print(f"  AICc           : {aicc_val:.4f}")
-    print(f"  BIC            : {result.bic:.4f}")
-    print(f"  k (params)     : {n_params}")
-    print(f"  n (obs)        : {n_obs}")
-    print(f"  Coefficients:")
-    for name, val, se in zip(result.param_names,
-                              result.params,
-                              result.bse):
-        print(f"    {name:<20} = {val:+.6f}  (SE={se:.6f})")
-    print(f"{'='*60}")
-
-    return {"label": label, "result": result, "aicc": aicc_val,
-            "order": order, "seasonal_order": seasonal_order}
+    n_params = result.df_model + 1            # +1 for sigma^2
+    aicc_val = compute_aicc(result.llf, n_params, n_obs)
+    if verbose:
+        print(f"  {label:<13} ll={result.llf:8.2f}  AIC={result.aic:8.2f}  "
+              f"AICc={aicc_val:8.2f}  BIC={result.bic:8.2f}  k={n_params}")
+    return {"label": label, "result": result, "aicc": aicc_val, "order": order}
 
 
-model_A = fit_sarima(Y_t, order=(1,1,1), seasonal_order=(1,1,1,S), label="Model A")
-model_B = fit_sarima(Y_t, order=(2,1,1), seasonal_order=(0,1,1,S), label="Model B")
+print("\n--- Candidate models (log scale, d=1) ---")
+candidates = {
+    "ARIMA(0,1,1)": (0, 1, 1),   # the ACF/PACF first guess (MA(1))
+    "ARIMA(1,1,1)": (1, 1, 1),
+    "ARIMA(2,1,1)": (2, 1, 1),
+    "ARIMA(1,1,2)": (1, 1, 2),
+    "ARIMA(2,1,2)": (2, 1, 2),
+}
+fits = {name: fit_arima(Y_t, order, name) for name, order in candidates.items()}
+best = min(fits.values(), key=lambda m: m["aicc"])
+print(f"\nBest by AICc: {best['label']}  (AICc = {best['aicc']:.2f})")
 
-best = min([model_A, model_B], key=lambda m: m["aicc"])
-print(f"\nBest model by AICc: {best['label']}  (AICc = {best['aicc']:.4f})")
+# Print the winning coefficient table in full
+res_best = best["result"]
+print(f"\n{best['label']} fitted coefficients:")
+for name, val, se in zip(res_best.param_names, res_best.params, res_best.bse):
+    print(f"    {name:<10} = {val:+.5f}  (SE={se:.5f})")
 
 
 # =============================================================================
 # 9. RESIDUAL DIAGNOSTICS
 # =============================================================================
-def mcleod_li_test(resid: np.ndarray, lags: list = [10, 20, 30]) -> pd.DataFrame:
+def mcleod_li_test(resid: np.ndarray, lags=(10, 20, 30)) -> pd.DataFrame:
     """
-    McLeod-Li test: Ljung-Box applied to the SQUARED residuals.
-    Tests for nonlinear structure / conditional heteroscedasticity (ARCH effects).
-    H0: no autocorrelation in squared residuals (linear model is adequate).
-    If H0 rejected, a GARCH extension may be warranted.
+    McLeod-Li test = Ljung-Box on the SQUARED residuals. Detects nonlinear
+    structure / conditional heteroscedasticity (ARCH effects) that the linear
+    Ljung-Box on the raw residuals cannot see.
+    H0: no autocorrelation in eps_t^2 (linear model adequate). Reject -> consider GARCH.
     """
-    squared = pd.Series(resid ** 2)
-    lb = acorr_ljungbox(squared, lags=lags, return_df=True)
-    print("\nMcLeod-Li Test (Ljung-Box on squared residuals):")
-    print(lb.to_string())
+    lb = acorr_ljungbox(pd.Series(resid ** 2), lags=list(lags), return_df=True)
+    print("  McLeod-Li (Ljung-Box on squared residuals):")
+    print(lb.to_string().replace("\n", "\n    "))
     return lb
 
 
-def plot_residuals(fit_result, label: str = "", fname_prefix: str = "") -> None:
-    resid = fit_result.resid.dropna().values
+def residual_diagnostics(fit_result, label: str = "", fname_prefix: str = "") -> dict:
+    # drop the first two values -- diffuse state-space initialisation transient
+    resid = fit_result.resid.dropna().values[2:]
 
     fig = plt.figure(figsize=(14, 10))
     gs  = gridspec.GridSpec(2, 2, figure=fig)
-
     ax1 = fig.add_subplot(gs[0, :])
     ax1.plot(resid, color="#4C72B0", lw=0.8)
     ax1.axhline(0, color="red", lw=0.8, ls="--")
-    ax1.set_title(f"Residuals — {label}")
+    ax1.set_title(f"Residuals - {label}")
     ax1.set_xlabel("Epoch")
-
     ax2 = fig.add_subplot(gs[1, 0])
-    plot_acf(resid, lags=40, alpha=0.05, ax=ax2, zero=False,
-             title="ACF of Residuals")
-
+    plot_acf(resid, lags=40, alpha=0.05, ax=ax2, zero=False, title="ACF of Residuals")
     ax3 = fig.add_subplot(gs[1, 1])
     probplot(resid, dist="norm", plot=ax3)
     ax3.set_title("Q-Q Plot of Residuals")
-
     plt.tight_layout()
     fname = f"{FIGURES_DIR}/residuals_{fname_prefix}.png"
     plt.savefig(fname, bbox_inches="tight")
     plt.close()
     print(f"Saved: {fname}")
 
-    # Ljung-Box on residuals
+    print(f"\nResidual tests ({label}):")
     lb = acorr_ljungbox(resid, lags=[10, 20, 30], return_df=True)
-    print(f"\nLjung-Box test on residuals ({label}):")
-    print(lb.to_string())
-
-    # Shapiro-Wilk (first 500 residuals)
-    stat, p_sw = shapiro(resid[:500])
-    print(f"Shapiro-Wilk: W={stat:.4f}  p={p_sw:.4f}")
-
-    # McLeod-Li test
-    mcleod_li_test(resid, lags=[10, 20, 30])
+    print("  Ljung-Box (residuals):")
+    print(lb.to_string().replace("\n", "\n    "))
+    sw_stat, sw_p = shapiro(resid[:500])
+    print(f"  Shapiro-Wilk (first 500): W={sw_stat:.4f}  p={sw_p:.2e}")
+    ml = mcleod_li_test(resid, lags=(10, 20, 30))
+    return {"resid": resid, "ljungbox": lb, "mcleodli": ml}
 
 
-plot_residuals(best["result"], label=best["label"],
-               fname_prefix=best["label"].replace(" ", "_"))
+diag = residual_diagnostics(res_best, label=best["label"], fname_prefix="ARIMA212")
 
 
 # =============================================================================
 # 10. FORECASTING & BACK-TRANSFORMATION
 # =============================================================================
-def forecast_and_backtransform(fit_dict: dict, steps: int,
-                                eps: float) -> pd.DataFrame:
+def backtransform_mean(log_mean, log_var, eps):
+    """Log-normal bias-corrected mean: E[X] = exp(mu + sigma^2/2) - eps."""
+    return np.exp(log_mean + log_var / 2.0) - eps
+
+
+def one_step_ahead(fit_dict, full_series, split, eps):
     """
-    Out-of-sample prediction on log scale, then bias-corrected back-transform.
-
-    Log scale:
-        Ŷ_{n+h} = point forecast
-        σ²_h    = forecast variance
-
-    Back-transform (log-normal mean):
-        X̂_{n+h} = exp(Ŷ_{n+h} + σ²_h / 2) − ε
-
-    95% CI:
-        Lower = exp(Ŷ_{n+h} − 1.96·σ_h) − ε
-        Upper = exp(Ŷ_{n+h} + 1.96·σ_h) − ε
-
-    The bias correction term σ²_h/2 arises because E[exp(Y)] = exp(μ + σ²/2)
-    for Y ~ N(μ, σ²). Omitting it systematically underestimates the mean.
+    Genuine 1-step-ahead forecasts over the test window using the FIXED fitted
+    parameters (state-space filtering via .append(..., refit=False)). This is the
+    honest evaluation for a short-horizon model -- a 530-step static forecast just
+    reverts to the mean and is meaningless here.
     """
-    result  = fit_dict["result"]
-    fc      = result.get_forecast(steps=steps)
-    fc_mean = fc.predicted_mean
-    fc_ci   = fc.conf_int(alpha=0.05)
-    fc_var  = fc.var_pred_mean
+    y_test_log = np.log(full_series.iloc[split:] + eps)
+    appended   = fit_dict["result"].append(y_test_log, refit=False)
+    pred_log   = appended.predict(start=split, end=len(full_series) - 1)
+    sigma2     = fit_dict["result"].params[-1]
+    return backtransform_mean(pred_log.values, sigma2, eps)
 
-    df = pd.DataFrame()
-    df["log_mean"] = fc_mean.values
-    df["log_lo"]   = fc_ci.iloc[:, 0].values
-    df["log_hi"]   = fc_ci.iloc[:, 1].values
-    df["fc_var"]   = fc_var.values if hasattr(fc_var, "values") else fc_var
 
-    df["forecast"]  = np.exp(df["log_mean"] + df["fc_var"] / 2.0) - eps
-    df["lower_95"]  = np.exp(df["log_lo"]) - eps
-    df["upper_95"]  = np.exp(df["log_hi"]) - eps
-
+def static_forecast(fit_dict, steps, eps):
+    """Static multi-step forecast on the log scale, back-transformed (for the plot/CI)."""
+    fc      = fit_dict["result"].get_forecast(steps=steps)
+    fc_mean = fc.predicted_mean.values
+    fc_var  = fc.var_pred_mean.values
+    ci      = fc.conf_int(alpha=0.05).values
+    df = pd.DataFrame({
+        "forecast": backtransform_mean(fc_mean, fc_var, eps),
+        "lower_95": np.exp(ci[:, 0]) - eps,
+        "upper_95": np.exp(ci[:, 1]) - eps,
+    })
     return df
 
 
-fc_df = forecast_and_backtransform(best, steps=len(test), eps=eps_val)
+def accuracy(actual, pred, label):
+    mae  = np.mean(np.abs(actual - pred))
+    rmse = np.sqrt(np.mean((actual - pred) ** 2))
+    mape = np.mean(np.abs((actual - pred) / actual)) * 100
+    print(f"  {label:<22} MAE={mae:.3e}  RMSE={rmse:.3e}  MAPE={mape:.2f}%")
+    return {"mae": mae, "rmse": rmse, "mape": mape}
 
 
-def plot_forecast(train_orig: pd.Series, test_orig: pd.Series,
-                  fc_df: pd.DataFrame, label: str = "") -> None:
+print("\n--- Forecast evaluation (test set) ---")
+actual = test.values
+pred_1step = one_step_ahead(best, X_t, split_idx, eps_val)
+acc_model  = accuracy(actual, pred_1step, f"{best['label']} 1-step")
+# Baselines for context
+accuracy(actual, X_t.shift(1).iloc[split_idx:].values,         "persistence (lag 1)")
+accuracy(actual, X_t.shift(S_ULTRADIAN).iloc[split_idx:].values, "naive seasonal (S=180)")
+
+fc_df = static_forecast(best, steps=len(test), eps=eps_val)
+
+
+def plot_forecast(train_orig, test_orig, pred_1step, fc_df, label=""):
     fig, ax = plt.subplots(figsize=(16, 5))
-    n_train = len(train_orig)
-    n_test  = len(test_orig)
-    t_train = np.arange(n_train)
-    t_test  = np.arange(n_train, n_train + n_test)
-
-    ax.plot(t_train, train_orig.values, color="#4C72B0", lw=0.9, label="Training")
-    ax.plot(t_test,  test_orig.values,  color="#55A868", lw=0.9, label="Actual (test)")
-    ax.plot(t_test,  fc_df["forecast"].values,
-            color="#C44E52", lw=1.3, ls="--", label=f"Forecast ({label})")
-    ax.fill_between(t_test, fc_df["lower_95"].values, fc_df["upper_95"].values,
-                    color="#C44E52", alpha=0.15, label="95% CI")
-    ax.set_title(f"Alpha Power Forecast — {label}")
+    n_tr, n_te = len(train_orig), len(test_orig)
+    t_tr = np.arange(n_tr)
+    t_te = np.arange(n_tr, n_tr + n_te)
+    ax.plot(t_tr, train_orig.values, color="#4C72B0", lw=0.8, label="Training")
+    ax.plot(t_te, test_orig.values,  color="#55A868", lw=0.8, label="Actual (test)")
+    ax.plot(t_te, pred_1step, color="#C44E52", lw=1.0,
+            label=f"1-step forecast ({label})")
+    ax.fill_between(t_te, fc_df["lower_95"].values, fc_df["upper_95"].values,
+                    color="#8172B3", alpha=0.18, label="95% PI (static)")
+    ax.set_title(f"Alpha Power Forecast - {label}")
     ax.set_xlabel("Epoch (30 s)")
-    ax.set_ylabel("Alpha Power (μV²/Hz)")
-    ax.legend(fontsize=9)
+    ax.set_ylabel("Alpha Power (uV^2/Hz)")
+    ax.legend(fontsize=9, ncol=2)
     plt.tight_layout()
     plt.savefig(f"{FIGURES_DIR}/forecast.png", bbox_inches="tight")
     plt.close()
     print(f"Saved: {FIGURES_DIR}/forecast.png")
 
-    actual = test_orig.values
-    pred   = fc_df["forecast"].values[:len(actual)]
-    mae    = np.mean(np.abs(actual - pred))
-    rmse   = np.sqrt(np.mean((actual - pred) ** 2))
-    mape   = np.mean(np.abs((actual - pred) / (actual + 1e-9))) * 100
-    print(f"\nForecast Accuracy ({label}):")
-    print(f"  MAE  = {mae:.6f}")
-    print(f"  RMSE = {rmse:.6f}")
-    print(f"  MAPE = {mape:.2f}%")
 
-plot_forecast(train, test, fc_df, label=best["label"])
+plot_forecast(train, test, pred_1step, fc_df, label=best["label"])
 
 
 # =============================================================================
 # 11. SPECTRAL ANALYSIS
-#     Periodogram, Fisher g-test, KS cumulative periodogram test,
-#     and parametric AR PSD
+#   - periodogram on the SERIES (to locate the seasonality)
+#   - Fisher g-test + KS cumulative-periodogram test on the RESIDUALS
+#     (white-noise check, per the spectral requirement)
+#   - parametric AR PSD for a smoother peak
+#
+# Fisher's g-test and the KS cumulative-periodogram (Bartlett) test are not in
+# statsmodels/scipy as one-liners; I implemented both from their definitions.
+# (R equivalents: GeneCycle::fisher.g.test and stats::cpgram.)
 # =============================================================================
-
 def fisher_g_test(Pxx: np.ndarray) -> tuple:
     """
-    Fisher's g-test for periodogram significance.
-    Tests whether the largest periodogram ordinate is significantly greater
-    than expected under the null hypothesis of white noise (iid Gaussian).
-
-    Test statistic:  g = max(I_j) / Σ I_j
-    P-value (exact): p = Σ_{k=1}^{floor(1/g)} (-1)^{k-1} C(m,k) (1 - k*g)^{m-1}
-    where m = number of Fourier frequencies (excluding zero).
-
-    H0: series is white noise (flat spectrum).
-    Reject H0 if p < 0.05 → significant periodicity detected.
+    Fisher g-test: is the largest periodogram ordinate larger than white noise allows?
+        g = max(I_j) / sum(I_j)
+        p = sum_{k=1}^{floor(1/g)} (-1)^{k-1} C(m,k) (1 - k g)^{m-1}
+    H0: white noise (flat spectrum). Reject (p<0.05) -> significant periodicity.
     """
-    m   = len(Pxx)
-    g   = np.max(Pxx) / np.sum(Pxx)
+    m = len(Pxx)
+    g = float(np.max(Pxx) / np.sum(Pxx))
     upper = int(np.floor(1.0 / g))
-    p_val = 0.0
-    for k in range(1, upper + 1):
-        sign = (-1) ** (k - 1)
-        p_val += sign * float(comb(m, k, exact=True)) * (1 - k * g) ** (m - 1)
-    p_val = np.clip(p_val, 0.0, 1.0)
-    print(f"\nFisher g-test:")
-    print(f"  g statistic = {g:.6f}")
-    print(f"  p-value     = {p_val:.6f}")
-    print(f"  → {'Significant periodicity detected' if p_val < 0.05 else 'No significant periodicity'} at 5% level")
-    return g, p_val
+    p_val = sum((-1) ** (k - 1) * float(comb(m, k, exact=True)) * (1 - k * g) ** (m - 1)
+                for k in range(1, upper + 1))
+    return g, float(np.clip(p_val, 0.0, 1.0))
 
 
 def ks_cumulative_periodogram(Pxx: np.ndarray) -> tuple:
     """
-    Kolmogorov-Smirnov test on the cumulative periodogram.
-    Under white noise, the normalized cumulative periodogram
-        C(k) = Σ_{j=1}^{k} I_j / Σ_{j=1}^{m} I_j
-    should follow a Uniform(0,1) distribution (Bartlett, 1954).
-
-    We apply scipy's two-sided KS test against Uniform(0,1).
-    H0: spectral mass is uniformly distributed → white noise.
-    Reject H0 if p < 0.05 → residual spectral structure remains.
+    Bartlett's KS test on the normalised cumulative periodogram
+        C(k) = sum_{j<=k} I_j / sum_j I_j
+    Under white noise the C(k) behave like ordered Uniform(0,1) draws, so a KS test
+    against Uniform(0,1) checks for leftover spectral structure. (Drop the final
+    point, which is identically 1.)  Reject (p<0.05) -> structure remains.
     """
-    m      = len(Pxx)
-    cumPxx = np.cumsum(Pxx) / np.sum(Pxx)
-    # Theoretical uniform quantiles at the same fractional positions
-    uniform_q = np.linspace(1 / m, 1.0, m)
-    ks_stat, p_val = kstest(cumPxx, "uniform")
-    print(f"\nKS Cumulative Periodogram Test:")
-    print(f"  KS statistic = {ks_stat:.6f}")
-    print(f"  p-value      = {p_val:.6f}")
-    print(f"  → {'Residual spectral structure detected' if p_val < 0.05 else 'No residual structure'} at 5% level")
-    return ks_stat, p_val, cumPxx, uniform_q
+    cum = np.cumsum(Pxx) / np.sum(Pxx)
+    ks_stat, p_val = kstest(cum[:-1], "uniform")
+    return float(ks_stat), float(p_val), cum
 
 
-def spectral_analysis(series: np.ndarray, epoch_sec: int = EPOCH_SEC,
-                       ar_max_order: int = 25) -> None:
-    """
-    Full spectral analysis of the alpha-power series X_t:
-      1. Non-parametric periodogram (Schuster)
-      2. Fisher g-test for dominant periodicity
-      3. KS test on cumulative periodogram (white-noise check)
-      4. Parametric AR PSD via Yule-Walker (AutoReg with AIC order selection)
+def spectral_analysis(series_full: np.ndarray, residuals: np.ndarray,
+                      epoch_sec: int = EPOCH_SEC, ar_max_order: int = 25) -> dict:
+    dt_hr = epoch_sec / 3600.0
 
-    Frequency axis converted to cycles/hour:
-        f_hr = f_epoch * (3600 / epoch_sec)
+    # --- periodogram of the (log) series -> locate seasonality ---
+    f_ep, Pxx = signal.periodogram(series_full, fs=1.0)   # fs = 1 / epoch
+    f_hr   = f_ep[1:] / dt_hr                              # cycles per hour (drop DC)
+    Pxx_nz = Pxx[1:]
 
-    Expected peaks:
-      ~0.67 cycles/hr (90-min NREM-REM ultradian cycle)
-      ~6.67 cycles/hr (9-min spindle-burst cadence)
-    """
-    n     = len(series)
-    dt_hr = epoch_sec / 3600.0     # hours per epoch
+    g_ser, gp_ser = fisher_g_test(Pxx_nz)
+    print("\n--- Spectral analysis ---")
+    print(f"  Periodogram of series : Fisher g={g_ser:.5f} p={gp_ser:.3g}  "
+          "(strong periodicity expected)")
+    print("  Top periodogram peaks:")
+    for idx in np.argsort(Pxx_nz)[-6:][::-1]:
+        cyc = f_hr[idx]
+        per_min = 60.0 / cyc if cyc > 0 else np.inf
+        print(f"    {cyc:6.3f} cyc/hr  ~ {per_min:7.1f} min")
 
-    # --- Non-parametric periodogram ---
-    f_ep, Pxx = signal.periodogram(series, fs=1.0)   # fs = 1 epoch^{-1}
-    f_hr      = f_ep / dt_hr                         # convert to cycles/hour
-    # Exclude DC (index 0)
-    f_hr_nz  = f_hr[1:]
-    Pxx_nz   = Pxx[1:]
+    # --- Fisher + KS on RESIDUALS (white-noise check) ---
+    f_r, Pxx_r = signal.periodogram(residuals, fs=1.0)
+    Pxx_r = Pxx_r[1:]
+    g_res, gp_res = fisher_g_test(Pxx_r)
+    ks_res, ksp_res, cum_res = ks_cumulative_periodogram(Pxx_r)
+    print(f"  Residual Fisher g-test : g={g_res:.5f}  p={gp_res:.3g}  "
+          f"-> {'periodicity remains' if gp_res < 0.05 else 'no leftover periodicity'}")
+    print(f"  Residual KS test       : D={ks_res:.4f}  p={ksp_res:.3g}  "
+          f"-> {'structure remains' if ksp_res < 0.05 else 'consistent with white noise'}")
 
-    # --- Fisher g-test ---
-    g_stat, g_pval = fisher_g_test(Pxx_nz)
-
-    # --- KS cumulative periodogram ---
-    ks_stat, ks_pval, cumPxx, unif_q = ks_cumulative_periodogram(Pxx_nz)
-
-    # --- Parametric AR PSD (AutoReg with AIC) ---
-    ar_model  = AutoReg(series, lags=ar_max_order, old_names=False).fit()
-    # Refit with AIC-selected order
-    best_aic  = np.inf
-    best_ar   = 1
+    # --- parametric AR PSD (AIC-selected order) ---
+    best_aic, best_ar = np.inf, 1
     for p in range(1, ar_max_order + 1):
         try:
-            m = AutoReg(series, lags=p, old_names=False).fit()
+            m = AutoReg(series_full, lags=p, old_names=False).fit()
             if m.aic < best_aic:
-                best_aic = m.aic
-                best_ar  = p
+                best_aic, best_ar = m.aic, p
         except Exception:
             pass
-    ar_fit    = AutoReg(series, lags=best_ar, old_names=False).fit()
-    ar_params = ar_fit.params[1:]   # exclude intercept
-    sigma2    = np.var(ar_fit.resid)
-    print(f"\nAR spectral estimate: order selected by AIC = {best_ar}")
-
-    w    = np.linspace(0, np.pi, 512)
-    H    = np.ones(len(w), dtype=complex)
+    ar_fit = AutoReg(series_full, lags=best_ar, old_names=False).fit()
+    ar_params = ar_fit.params[1:]               # drop intercept
+    sigma2 = np.var(ar_fit.resid)
+    print(f"  Parametric AR order (AIC) = {best_ar}")
+    w = np.linspace(0, np.pi, 512)
+    H = np.ones(len(w), dtype=complex)
     for k, a_k in enumerate(ar_params, start=1):
         H -= a_k * np.exp(-1j * w * k)
     S_ar = sigma2 / (np.abs(H) ** 2)
     f_ar = (w / (2 * np.pi)) / dt_hr
 
-    # --- Top periodogram peaks ---
-    peak_idx = np.argsort(Pxx_nz)[-5:][::-1]
-    print("\nTop-5 Periodogram Peaks:")
-    for idx in peak_idx:
-        cyc_hr     = f_hr_nz[idx]
-        period_min = 60.0 / cyc_hr if cyc_hr > 0 else np.inf
-        print(f"  f = {cyc_hr:.4f} cyc/hr  →  period ≈ {period_min:.1f} min  "
-              f"(Pxx = {Pxx_nz[idx]:.4e})")
-
-    # --- Plots ---
+    # --- plots ---
     fig, axes = plt.subplots(3, 1, figsize=(14, 12))
-
-    # Periodogram
-    axes[0].semilogy(f_hr_nz, Pxx_nz, color="#4C72B0", lw=0.8)
+    axes[0].semilogy(f_hr, Pxx_nz, color="#4C72B0", lw=0.8)
     axes[0].axvline(1 / 1.5, color="red", lw=1.2, ls="--",
-                    label="~90-min NREM-REM cycle (0.67 cyc/hr)")
-    axes[0].axvline(1 / 0.15, color="orange", lw=1.0, ls=":",
-                    label="~9-min spindle cadence (6.67 cyc/hr)")
-    axes[0].set_title("Periodogram of Alpha-Power Series X_t")
+                    label="~90-min ultradian band (0.67 cyc/hr)")
+    axes[0].set_title("Periodogram of log Alpha-Power Series")
     axes[0].set_xlabel("Frequency (cycles / hour)")
     axes[0].set_ylabel("Power (log scale)")
+    axes[0].set_xlim(0, 8)
     axes[0].legend(fontsize=9)
 
-    # AR PSD
     axes[1].semilogy(f_ar[1:], S_ar[1:], color="#C44E52", lw=1.0)
-    axes[1].axvline(1 / 1.5, color="navy", lw=1.2, ls="--",
-                    label=f"~90-min cycle | AR({best_ar}) PSD")
-    axes[1].set_title(f"Parametric AR({best_ar}) Spectral Estimate (AIC-selected order)")
+    axes[1].set_title(f"Parametric AR({best_ar}) Spectral Estimate (AIC-selected)")
     axes[1].set_xlabel("Frequency (cycles / hour)")
     axes[1].set_ylabel("PSD")
-    axes[1].legend(fontsize=9)
+    axes[1].set_xlim(0, 8)
 
-    # Cumulative periodogram
-    freq_positions = np.linspace(0, 1, len(Pxx_nz))
-    axes[2].plot(freq_positions, cumPxx, color="#4C72B0", lw=1.2,
-                 label="Cumulative periodogram")
-    axes[2].plot(freq_positions, freq_positions, color="red", lw=1.0, ls="--",
+    freq_pos = np.linspace(0, 1, len(cum_res))
+    axes[2].plot(freq_pos, cum_res, color="#4C72B0", lw=1.2,
+                 label="Cumulative periodogram (residuals)")
+    axes[2].plot(freq_pos, freq_pos, color="red", lw=1.0, ls="--",
                  label="Expected under white noise")
-    axes[2].set_title(f"Cumulative Periodogram  (KS stat={ks_stat:.4f}, p={ks_pval:.4f})")
-    axes[2].set_xlabel("Normalized frequency")
+    axes[2].set_title(f"Residual Cumulative Periodogram  (KS D={ks_res:.4f}, p={ksp_res:.3g})")
+    axes[2].set_xlabel("Normalised frequency")
     axes[2].set_ylabel("Cumulative spectral mass")
     axes[2].legend(fontsize=9)
 
@@ -619,8 +586,28 @@ def spectral_analysis(series: np.ndarray, epoch_sec: int = EPOCH_SEC,
     plt.savefig(f"{FIGURES_DIR}/spectral_analysis.png", bbox_inches="tight")
     plt.close()
     print(f"Saved: {FIGURES_DIR}/spectral_analysis.png")
+    return {"fisher_series": (g_ser, gp_ser), "fisher_resid": (g_res, gp_res),
+            "ks_resid": (ks_res, ksp_res), "ar_order": best_ar}
 
 
-spectral_analysis(X_t.values, epoch_sec=EPOCH_SEC)
+spec = spectral_analysis(log_transform(X_t).values, diag["resid"], epoch_sec=EPOCH_SEC)
 
-print("\n=== Pipeline complete. All figures saved to outputs/figures/ ===")
+
+# =============================================================================
+# 12. RESULTS SUMMARY
+# =============================================================================
+print("\n" + "=" * 64)
+print("RESULTS SUMMARY")
+print("=" * 64)
+print(f"Series           : {len(X_t)} epochs (~{len(X_t)*EPOCH_SEC/3600:.1f} h)  "
+      f"train={len(train)} test={len(test)}")
+print(f"Best model       : {best['label']}  AICc={best['aicc']:.2f}")
+print(f"1-step MAPE      : {acc_model['mape']:.2f}%")
+print(f"Ljung-Box p (resid)  : "
+      f"{[round(p,3) for p in diag['ljungbox']['lb_pvalue']]}  (>0.05 = white noise)")
+print(f"McLeod-Li p (resid^2): "
+      f"{[f'{p:.2e}' for p in diag['mcleodli']['lb_pvalue']]}  (<0.05 = ARCH effect)")
+print(f"Residual Fisher  : p={spec['fisher_resid'][1]:.3g}   "
+      f"Residual KS: p={spec['ks_resid'][1]:.3g}")
+print("=" * 64)
+print("Pipeline complete. Figures in outputs/figures/.")

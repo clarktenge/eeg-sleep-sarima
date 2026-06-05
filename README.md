@@ -1,163 +1,129 @@
 # Rhythms of the Sleeping Brain
 
-> Can a classical SARIMA model track when a sleeping brain shifts between sleep stages?
-> **TL;DR:** A manually-tuned SARIMA model achieves 0.30% MAPE on held-out overnight EEG alpha power — and spectral analysis confirms the dominant ~90-minute NREM-REM ultradian cycle without a single call to `auto_arima`.
+> Can a classical, fully hand-built time-series model track overnight EEG alpha power — and does the "obvious" 90-minute sleep cycle actually belong in the model?
+> **TL;DR:** I model overnight EEG alpha power with an ARIMA fit entirely by hand (no `auto_arima`). The physiologically obvious seasonal period (S = 180 ≈ 90 min) turns out to be wrong — it over-differences the series and has no ACF/PACF signature — so the final model is a non-seasonal **ARIMA(2,1,2)**, with the ultradian rhythm documented through spectral analysis instead.
 
-**Author:** Clark Enge (<clarkenge@ucsb.edu>)  
-**Status:** Active development — seasonal period refinement in progress
+**Author:** Clark Enge (<clarkenge@ucsb.edu>)
+**Course:** PSTAT W 274 — Time Series Analysis
 
 ---
 
 ## The Problem
 
-Closed-loop neural interfaces — cortical stimulators, motor-imagery decoders, sleep-stage monitors — must continuously estimate a patient's sleep state to calibrate stimulation thresholds. Over-stimulating during slow-wave sleep can disrupt memory consolidation; under-stimulating during REM disrupts therapeutic effect.
-
-**Alpha power (8–13 Hz)** is a canonical biomarker for arousal state:
+Closed-loop neural interfaces — cortical stimulators, sleep-stage monitors — need a running estimate of a patient's sleep state to calibrate stimulation. **Alpha power (8–13 Hz)** is a convenient proxy for arousal state:
 
 ```
-Wake / N1 onset:  alpha elevated   →  brain idling, eyes closed
-N2 / N3 (SWS):   alpha suppressed →  deep slow-wave sleep
-REM:              alpha transient  →  dreaming, muscle atonia
+Wake / N1 onset:  alpha elevated   ->  brain idling, eyes closed
+N2 / N3 (SWS):    alpha suppressed ->  deep slow-wave sleep
+REM:              alpha transient  ->  dreaming, muscle atonia
 ```
 
-A model that forecasts alpha power one to three epochs ahead (30–90 seconds) gives an implanted device a short look-ahead for state transitions. This project fits that model using classical transparent SARIMA — fully auditable, no black-box components, algebraically expressible. That matters for regulatory submissions.
+A model that forecasts alpha power a step or two ahead gives such a device a short look-ahead. I build that model with classical, transparent ARIMA — every step done by hand so the result is fully auditable.
 
-The time series `X_t` is constructed by extracting alpha-band power from each 30-second EEG epoch, producing ~2650 observations across a full overnight recording:
+The series `X_t` is built by extracting alpha-band power from each 30-second EEG epoch, giving ~2650 observations across the overnight recording:
 
 ```
 Raw EDF (Fpz-Cz, 100 Hz)
-    │
-    ▼
-4th-order zero-phase Butterworth [8–13 Hz] per epoch
-    │
-    ▼
-Welch PSD (2-second Hann windows, 50% overlap)
-    │
-    ▼
-X_t = ∫₈¹³ P̂ₓₓ(f) df   [μV²/Hz per epoch]
-    │
-    ▼
-~2650-point univariate time series → SARIMA modeling
+    -> 4th-order zero-phase Butterworth [8-13 Hz] per epoch
+    -> Welch PSD (2 s Hann windows, 50% overlap)
+    -> X_t = integral of PSD over 8-13 Hz   [uV^2/Hz per epoch]
+    -> ~2650-point univariate series -> ARIMA modeling
 ```
 
 ---
 
 ## The Pipeline
 
-### Step 1 — Signal Processing
+### Step 1 — Signal processing
 
-Each 30-second epoch (3000 samples at 100 Hz) is band-pass filtered and transformed into a single scalar via Welch's method and trapezoidal integration. Zero-phase filtering (`sosfiltfilt`) prevents phase distortion on short segments.
+Each 30-second epoch (3000 samples at 100 Hz) is band-pass filtered and reduced to one scalar via Welch's method and trapezoidal integration. Zero-phase filtering (`sosfiltfilt`) avoids the phase lag a causal filter would add on such short segments. Values land around 10⁻¹¹ μV²/Hz, which is why all modeling happens on the log scale.
 
-```python
-# Per-epoch alpha power extraction
-freqs, pxx = signal.welch(filtered_epoch, fs=100, nperseg=200, window='hann')
-alpha_mask  = (freqs >= 8) & (freqs <= 13)
-X_t         = np.trapz(pxx[alpha_mask], freqs[alpha_mask])   # μV²/Hz
-```
+### Step 2 — Transformation & stationarity
 
-Values are on the order of 10⁻¹¹ μV²/Hz — extremely small, which is why all modeling is done on the log scale.
-
-### Step 2 — Transformation & Stationarity
-
-The raw series is right-skewed and exhibits variance proportional to its level (visible in the rolling statistics). A log transform stabilizes variance before differencing:
+The rolling standard deviation tracks the rolling mean (variance proportional to level), so I log-transform before differencing:
 
 ```
-Y_t = log(X_t + ε),   ε = 10⁻⁶ · median(X_t)
+Y_t = log(X_t + eps),   eps = 1e-6 * median(X_t)
 ```
 
-**ADF test results** — only tests for unit root; not a complete stationarity check:
+ADF results (the test only detects a unit root — not seasonality, variance changes, or breaks):
 
-| Series | ADF Statistic | p-value | Decision |
+| Series | ADF stat | p-value | Decision |
 |---|---|---|---|
-| `X_t` raw | — | — | Non-stationary (rolling mean drifts) |
-| `log(X_t)` | −7.69 | < 0.001 | Stationary by ADF |
-| `∇ log(X_t)` | −16.92 | < 0.001 | Stationary |
-| `∇∇₁₈ log(X_t)` | −16.74 | < 0.001 | Stationary |
+| `log(X_t)` | −7.69 | ~1e-11 | Stationary by ADF |
+| `∇ log(X_t)` | −16.92 | ~1e-29 | Stationary |
 
-`log(X_t)` already passes ADF, but the rolling mean is visibly non-constant — ADF detects only unit-root non-stationarity, not the oscillatory macrostructure visible in the EDA plots. We proceed with `d=1`.
+`log(X_t)` already passes ADF, but the rolling mean wanders and the log level decays slowly, so I still take one regular difference (`d = 1`) for practical ARMA modeling. This is exactly the ADF caveat in action: passing the test is not the same as being stationary.
 
-### Step 3 — Model Identification
+### Step 3 — Testing (and rejecting) the seasonal heuristic
 
-ACF/PACF of the differenced series `∇∇₁₈ log(X_t)` (S = 18 epochs ≈ 9 minutes) reveals the non-seasonal and seasonal order structure. Visual cutoff rules applied manually — no `auto_arima`.
+The NREM-REM cycle is ~90 min = 180 epochs, so a seasonal SARIMA at S = 180 looks obvious. I tested it and rejected it on three independent grounds:
 
-Two candidate models compared:
-
-| Model | Specification | k | n | Log-Lik | AICc |
-|---|---|---|---|---|---|
-| Model A | SARIMA(1,1,1)(1,1,1)[18] | 6 | 2120 | −404.63 | 821.30 |
-| **Model B** | **SARIMA(2,1,1)(0,1,1)[18]** | **6** | **2120** | **−401.29** | **814.61** |
-
-**Model B wins** with ΔAICc = 6.69 — a meaningful difference (rule of thumb: >2 is meaningful, >10 is decisive). AICc is computed from first principles:
-
-```python
-AICc = -2·ℓ(θ̂) + 2k + 2k(k+1)/(n-k-1)
-```
-
-**Model B fitted equation** (SARIMA(2,1,1)(0,1,1)[18]):
-
-```
-(1 − φ₁B − φ₂B²)(1 − B¹⁸)(1 − B) Yₜ = (1 + Θ₁B¹⁸)(1 + θ₁B) εₜ
-
-φ₁ = +0.3140  (SE = 0.0253)
-φ₂ = +0.0853  (SE = 0.0221)
-θ₁ = −0.8962  (SE = 0.0152)
-Θ₁ = −0.9990  (SE = 0.1337)
-σ̂² =  0.0824  (SE = 0.0110)
-```
-
-### Step 4 — Residual Diagnostics
-
-| Test | Lag | Statistic | p-value | Decision |
-|---|---|---|---|---|
-| Ljung-Box (residuals) | 10 | 4.64 | 0.914 | ✓ White noise |
-| Ljung-Box (residuals) | 20 | 233.8 | < 0.001 | ✗ Autocorrelation |
-| Ljung-Box (residuals) | 30 | 236.6 | < 0.001 | ✗ Autocorrelation |
-| McLeod-Li (ε²) | 10 | 0.003 | 1.000 | ✓ No ARCH effect |
-| McLeod-Li (ε²) | 20 | 109.5 | < 0.001 | ✗ Nonlinear structure |
-| Shapiro-Wilk | — | W = 0.171 | < 0.001 | ✗ Non-normal |
-
-The model passes at lag 10 but fails at lags 20 and 30 — residual autocorrelation remains beyond the immediate neighborhood. The most likely cause: **the seasonal period S = 18 (9 minutes) is misspecified**. Spectral analysis (below) identifies the dominant cycle at ~90 minutes, corresponding to S = 180. Refitting with S = 180 is the primary next step.
-
-### Step 5 — Forecasting
-
-Forecasts are generated on the log scale and back-transformed with a bias correction for the log-normal mean:
-
-```
-X̂ₙ₊ₕ = exp(Ŷₙ₊ₕ + σ̂²ₕ/2) − ε          (bias-corrected mean)
-Lower = exp(Ŷₙ₊ₕ − 1.96·σ̂ₕ) − ε
-Upper = exp(Ŷₙ₊ₕ + 1.96·σ̂ₕ) − ε
-```
-
-The `+ σ̂²ₕ/2` term corrects for the fact that `E[e^Y] = e^(μ + σ²/2)` for Gaussian `Y` — omitting it would systematically underestimate the mean.
-
-**Forecast accuracy on held-out test set (530 epochs, ~4.4 hours):**
-
-| Metric | Value |
+| Check | Result |
 |---|---|
-| MAPE | 0.30% |
-| RMSE | ~10⁻¹¹ μV²/Hz |
-| MAE | ~10⁻¹¹ μV²/Hz |
+| Over-differencing (variance should *drop*) | var rises 0.111 → 0.230 (S=18) / 0.220 (S=180) → **over-differencing** |
+| Seasonal ACF/PACF spike at lag 18/147/180/189 | none significant (all inside ±0.043 band) |
+| Fit a state-space SARIMA at S=180 | ~180-dim state, does not converge in reasonable time |
 
-MAPE of 0.30% is the interpretable metric — RMSE and MAE reflect the extremely small absolute scale of alpha power values.
+The ultradian rhythm is real but **spectrally broad** (66–95 min; see Step 6), so no single seasonal lag captures it. I model the mean with a non-seasonal ARIMA and treat the rhythm as a spectral finding.
 
-### Step 6 — Spectral Analysis
+### Step 4 — Model identification & selection
+
+ACF of `∇ log(X_t)` shows one big spike at lag 1 (−0.38) then nothing; PACF tails off → first guess **MA(1) = ARIMA(0,1,1)**. I then compared candidates by a hand-coded AICc:
+
+| Model | AICc | Ljung-Box (10/20/30) |
+|---|---|---|
+| ARIMA(0,1,1) — ACF/PACF guess | 793.4 | fails (~1e-9) |
+| ARIMA(1,1,1) | 732.6 | borderline |
+| ARIMA(2,1,1) | 725.8 | passes |
+| ARIMA(1,1,2) | 719.2 | passes |
+| **ARIMA(2,1,2)** | **700.9** | **passes (0.71 / 0.82 / 0.69)** |
+
+**ARIMA(2,1,2) wins** (ΔAICc ≈ 18 over the next-best — decisive). Note the AICc model is *not* the ACF/PACF guess: the simple MA(1) fails its residual tests, so diagnostics + AICc pushed me to the richer model.
+
+**Fitted model** (log scale, `Y_t = log(X_t + eps)`):
+
+```
+(1 - 1.134 B + 0.187 B^2)(1 - B) Y_t = (1 - 1.730 B + 0.731 B^2) eps_t
+
+phi_1 = +1.1340 (SE 0.044)    theta_1 = -1.7296 (SE 0.036)
+phi_2 = -0.1873 (SE 0.034)    theta_2 = +0.7311 (SE 0.036)
+sigma^2 = 0.0810 (SE 0.002)
+```
+
+### Step 5 — Residual diagnostics
+
+| Test | Result | Verdict |
+|---|---|---|
+| Ljung-Box (residuals, lags 10/20/30) | p = 0.71 / 0.82 / 0.69 | ✓ white noise |
+| Shapiro-Wilk (first 500) | W = 0.988, p ≈ 5e-4 | mild non-normality (sensitive at n≈2100) |
+| **McLeod-Li** (Ljung-Box on ε²) | p ~ 1e-8 | ✗ **ARCH effect** |
+
+The mean model is clean (Ljung-Box passes), but McLeod-Li shows volatility clustering in the squared residuals — a genuine conditional-heteroscedasticity effect, and the clearest motivation for a future ARIMA+GARCH extension.
+
+### Step 6 — Forecasting
+
+I report the **1-step-ahead** forecast (fixed parameters, filtered through the test set) — the honest metric for a short-horizon model, since a 530-step static forecast just reverts to the mean. Back-transform uses the log-normal bias correction `X̂ = exp(Ŷ + σ²/2) − eps`.
+
+| Forecaster | Test MAPE |
+|---|---|
+| **ARIMA(2,1,2) 1-step** | **20.1%** |
+| Persistence (lag 1) | 23.2% |
+| Naive seasonal (S = 180) | 31.2% |
+
+The model beats both baselines, so it adds real short-horizon information.
+
+### Step 7 — Spectral analysis
+
+Periodogram to locate seasonality (on the series); Fisher's g-test and the KS cumulative-periodogram test to check the **residuals** are white (both implemented from scratch — R equivalents are `GeneCycle::fisher.g.test` and `stats::cpgram`).
 
 | Test | Statistic | p-value | Conclusion |
 |---|---|---|---|
-| Fisher g-test | g = 0.0536 | < 0.001 | Dominant periodicity is significant |
-| KS cumulative periodogram | D = 0.413 | < 0.001 | Spectral structure present |
+| Fisher g (series) | g = 0.078 | ~1e-44 | strong periodicity in `X_t` |
+| Fisher g (residuals) | g = 0.008 | 0.23 | no leftover periodicity ✓ |
+| KS cumulative periodogram (residuals) | D = 0.018 | 0.87 | residuals ~ white noise ✓ |
 
-**Top periodogram peaks:**
-
-| Rank | Frequency | Period | Interpretation |
-|---|---|---|---|
-| 1 | 0.091 cyc/hr | ~663 min | Overnight trend (full recording) |
-| 2 | 0.045 cyc/hr | ~1325 min | Subharmonic of recording length |
-| **3** | **0.815 cyc/hr** | **~74 min** | **NREM-REM ultradian cycle** |
-| **4** | **0.634 cyc/hr** | **~95 min** | **NREM-REM ultradian cycle** |
-| 5 | 0.906 cyc/hr | ~66 min | Sleep cycle harmonic |
-
-The 74- and 95-minute peaks straddle the canonical 90-minute NREM-REM ultradian rhythm — strong evidence that **S = 180 epochs** (180 × 30s = 90 min) is the correct seasonal period, not S = 18.
+Dominant periodogram peaks (excluding trend harmonics): **73.6, 94.6, 66.2, 69.7 min** — a band around the ~90-minute NREM-REM cycle. The spread across periods is exactly why a single seasonal lag failed in Step 3.
 
 ---
 
@@ -167,66 +133,20 @@ The 74- and 95-minute peaks straddle the canonical 90-minute NREM-REM ultradian 
 |---|---|
 | Series length | 2650 epochs (~22.1 hours) |
 | Train / Test | 2120 / 530 epochs (80/20) |
-| Best model | SARIMA(2,1,1)(0,1,1)[18], AICc = 814.61 |
-| Forecast MAPE (test) | 0.30% |
-| Dominant spectral peak | ~90-min ultradian NREM-REM cycle |
-| Fisher g-test | p < 0.001 — significant periodicity |
-| Ljung-Box (lag 10) | p = 0.914 — white noise ✓ |
-| Ljung-Box (lag 20/30) | p < 0.001 — autocorrelation remains ✗ |
+| Best model | ARIMA(2,1,2), AICc = 700.9 |
+| Ljung-Box (residuals) | p = 0.71 / 0.82 / 0.69 — white noise ✓ |
+| McLeod-Li | p ~ 1e-8 — ARCH effect (future GARCH work) |
+| Forecast MAPE (1-step) | 20.1% (beats persistence 23.2%, naive 31.2%) |
+| Dominant spectral band | ~66–95 min ultradian NREM-REM cycle |
+| Residual Fisher / KS | p = 0.23 / 0.87 — residuals spectrally white ✓ |
 
 ---
 
 ## Figures
 
-| | |
-|---|---|
-| [![EDA](https://github.com/clarktenge/eeg-sleep-sarima/raw/main/outputs/figures/eda_plots.png)](https://github.com/clarktenge/eeg-sleep-sarima/blob/main/outputs/figures/eda_plots.png) | [![ACF/PACF](https://github.com/clarktenge/eeg-sleep-sarima/raw/main/outputs/figures/acf_pacf.png)](https://github.com/clarktenge/eeg-sleep-sarima/blob/main/outputs/figures/acf_pacf.png) |
-| [![Residuals](https://github.com/clarktenge/eeg-sleep-sarima/raw/main/outputs/figures/residuals_Model_B.png)](https://github.com/clarktenge/eeg-sleep-sarima/blob/main/outputs/figures/residuals_Model_B.png) | [![Forecast](https://github.com/clarktenge/eeg-sleep-sarima/raw/main/outputs/figures/forecast.png)](https://github.com/clarktenge/eeg-sleep-sarima/blob/main/outputs/figures/forecast.png) |
-| [![Spectral Analysis](https://github.com/clarktenge/eeg-sleep-sarima/raw/main/outputs/figures/spectral_analysis.png)](https://github.com/clarktenge/eeg-sleep-sarima/blob/main/outputs/figures/spectral_analysis.png) | [![ACF/PACF (no seasonal diff)](https://github.com/clarktenge/eeg-sleep-sarima/raw/main/outputs/figures/acf_pacf_nodiff.png)](https://github.com/clarktenge/eeg-sleep-sarima/blob/main/outputs/figures/acf_pacf_nodiff.png) |
+All figures are regenerated by `pipeline.py` into `outputs/figures/`:
 
----
-
-## Under the Hood
-
-### Alpha Power Extraction ([`pipeline.py`](pipeline.py))
-
-The Welch method with 2-second Hann-windowed segments gives a lower-variance PSD estimate than the raw periodogram, at the cost of frequency resolution. For a 30-second epoch at 100 Hz:
-
-```
-N_epoch = 3000 samples
-nperseg = 200 samples (2 seconds)
-overlap = 50%  →  number of segments = ~29
-frequency resolution = 100/200 = 0.5 Hz
-```
-
-The 0.5 Hz resolution is sufficient to resolve the 8–13 Hz alpha band cleanly.
-
-### Manual AICc ([`pipeline.py`](pipeline.py))
-
-AICc is computed from raw model attributes — no wrapper functions:
-
-```python
-ll       = result.llf          # maximized log-likelihood
-k        = result.df_model + 1 # free parameters including σ²
-n        = result.nobs         # effective observations after differencing
-aic      = -2*ll + 2*k
-aicc     = aic + (2*k*(k+1)) / (n - k - 1)
-```
-
-### Fisher g-test ([`pipeline.py`](pipeline.py))
-
-Tests whether the largest periodogram ordinate is significant against a flat (white noise) spectrum. Exact p-value via:
-
-```
-g = max(Iⱼ) / Σ Iⱼ
-p = Σₖ₌₁^⌊1/g⌋ (-1)^(k-1) · C(m,k) · (1 - k·g)^(m-1)
-```
-
-where `m` is the number of Fourier frequencies (excluding DC).
-
-### McLeod-Li Test ([`pipeline.py`](pipeline.py))
-
-Ljung-Box applied to the **squared residuals** εₜ². Tests for nonlinear structure (ARCH/GARCH effects). A linear SARIMA model produces uncorrelated εₜ but not necessarily uncorrelated εₜ² — volatility clustering in the residuals signals that a GARCH extension may be warranted.
+`eda_plots.png` · `acf_pacf.png` · `residuals_ARIMA212.png` · `forecast.png` · `spectral_analysis.png`
 
 ---
 
@@ -234,14 +154,11 @@ Ljung-Box applied to the **squared residuals** εₜ². Tests for nonlinear stru
 
 ```
 eeg-sleep-sarima/
-├── data/
-│   ├── SC4001E0-PSG.edf          # PhysioNet Sleep-EDF — PSG recording (excluded from git)
-│   └── SC4001EC-Hypnogram.edf    # Sleep stage annotations (excluded from git)
-├── outputs/
-│   └── figures/                  # EDA, ACF/PACF, residuals, forecast, spectral
-├── eeg_sleep_sarima.ipynb        # Main analysis notebook (12 sections, step-by-step)
-├── pipeline.py                   # Headless runnable script (same logic, saves to outputs/)
-├── report_outline.md             # Structured report scaffold
+├── data/                       # PhysioNet EDF files (excluded from git)
+├── outputs/figures/            # EDA, ACF/PACF, residuals, forecast, spectral
+├── eeg_sleep_sarima.ipynb      # Main analysis notebook (step-by-step, executed)
+├── pipeline.py                 # Headless runnable script (same logic)
+├── report_outline.md           # Report draft / outline
 ├── requirements.txt
 └── .gitignore
 ```
@@ -253,77 +170,32 @@ eeg-sleep-sarima/
 ```bash
 git clone https://github.com/clarktenge/eeg-sleep-sarima.git
 cd eeg-sleep-sarima
-
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Download the two EDF files from [PhysioNet Sleep-EDF](https://physionet.org/content/sleep-edfx/1.0.0/) (free account required) and place them in `data/`:
-
-```
-data/SC4001E0-PSG.edf
-data/SC4001EC-Hypnogram.edf
-```
-
-Run the full pipeline headlessly:
+Download the EDF files from [PhysioNet Sleep-EDF](https://physionet.org/content/sleep-edfx/1.0.0/) into `data/`, then:
 
 ```bash
-python pipeline.py
-# Figures saved to outputs/figures/
-```
-
-Or open the notebook for the step-by-step walkthrough:
-
-```bash
-jupyter notebook eeg_sleep_sarima.ipynb
+python pipeline.py                  # regenerates every figure in outputs/figures/
+# or open eeg_sleep_sarima.ipynb for the step-by-step walkthrough
 ```
 
 ---
 
 ## Key Findings
 
-### 1. S = 18 Is Likely the Wrong Seasonal Period
-
-The candidate seasonal period of 18 epochs (9 minutes) was chosen as an initial hypothesis. The spectral analysis finds the dominant cycles at 74 and 95 minutes — bracketing the canonical 90-minute NREM-REM ultradian rhythm. S = 180 (90-minute period) is the well-supported alternative. The Ljung-Box failure at lags 20 and 30 is consistent with this misspecification.
-
-### 2. ADF Alone Is Not Enough
-
-`log(X_t)` passes the ADF test (p < 0.001, stat = −7.69), suggesting no unit root — yet the rolling mean in the EDA clearly oscillates and the ACF of the raw log series decays slowly. ADF tests only for stochastic trend; the oscillatory macrostructure requires differencing regardless. This is why stationarity must be assessed visually alongside the formal test.
-
-### 3. 0.30% MAPE Without Overfitting
-
-Despite the residual autocorrelation issue, the model achieves 0.30% MAPE on the 20% held-out test set. The forecast tracks the general trajectory of alpha power across a 4.4-hour test window.
-
-### 4. Spectral Confirmation of Sleep Architecture
-
-Fisher's g-test (p < 0.001) confirms the dominant spectral peak is not attributable to chance. The cumulative periodogram diverges significantly from the white-noise diagonal (KS D = 0.413) — most spectral mass is concentrated in the low-frequency cycles corresponding to the ultradian sleep rhythm.
-
----
-
-## Open Questions
-
-- **S = 180 refit:** Does a 90-minute seasonal period clean up the residual autocorrelation at lags 20 and 30?
-- **McLeod-Li at lag 20+:** Is the nonlinear structure genuine (ARCH effects) or an artifact of the wrong seasonal period?
-- **Multi-subject generalization:** Does the same SARIMA structure hold across different subjects in the Sleep-EDF cassette recordings?
-- **Comparison baseline:** How does the SARIMA forecast compare to a naïve seasonal baseline (repeat last cycle) on RMSE/MAPE?
+1. **The 90-minute seasonal model is the wrong tool here.** It over-differences, has no ACF/PACF signature, and is computationally impractical. The honest move was to drop it and capture the rhythm spectrally.
+2. **ADF alone is not enough.** `log(X_t)` passes ADF yet still needs differencing — the test only sees unit-root non-stationarity, so I read it alongside the EDA and ACF.
+3. **AICc disagreed with my ACF/PACF guess, and it was right.** MA(1) looked clean on the plots but failed Ljung-Box; ARIMA(2,1,2) is the AICc-best model with white-noise residuals.
+4. **The residuals are linearly white but nonlinearly structured.** Ljung-Box and the spectral tests pass, but McLeod-Li reveals an ARCH effect — a clear, honest direction for future GARCH work.
 
 ---
 
 ## Data
 
-**Source:** [PhysioNet Sleep-EDF Expanded Database](https://physionet.org/content/sleep-edfx/1.0.0/)
-
-Kemp B, Värri A, Rosa AC, Nielsen KD, Gade J. (2000). A simple format for exchange of digitized polygraphic recordings. *Electroencephalography and Clinical Neurophysiology*, 69(4), 391–395.
-
-Goldberger AL, et al. (2000). PhysioBank, PhysioToolkit, and PhysioNet. *Circulation*, 101(23), e215–e220.
-
-EDF files are excluded from version control (`.gitignore`). Access requires a free PhysioNet credentialed account.
-
----
+[PhysioNet Sleep-EDF Expanded Database](https://physionet.org/content/sleep-edfx/1.0.0/). Kemp B. et al. (2000), *Electroenceph. Clin. Neurophysiol.* 69(4); Goldberger A.L. et al. (2000), *Circulation* 101(23). EDF files are excluded from version control; access requires a free PhysioNet account.
 
 ## Dependencies
 
-Python 3.10+ · `mne` · `scipy` · `statsmodels` · `numpy` · `pandas` · `matplotlib` · `seaborn`
-
-See [`requirements.txt`](requirements.txt) for the full pinned list.
+Python 3.10+ · `mne` · `scipy` · `statsmodels` · `numpy` · `pandas` · `matplotlib` · `seaborn`. See `requirements.txt`.
