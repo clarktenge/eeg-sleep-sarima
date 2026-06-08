@@ -1,7 +1,8 @@
 # Rhythms of the Sleeping Brain
 
-> Can a classical, fully hand-built time-series model track overnight EEG alpha power — and does the "obvious" 90-minute sleep cycle actually belong in the model?
-> **TL;DR:** I model overnight EEG alpha power with an ARIMA fit entirely by hand (no `auto_arima`). The physiologically obvious seasonal period (S = 180 ≈ 90 min) turns out to be wrong — it over-differences the series and has no ACF/PACF signature — so the final model is a non-seasonal **ARIMA(2,1,2)**, with the ultradian rhythm documented through spectral analysis instead.
+> Can a classical, fully hand-built time-series model track overnight EEG alpha power - and does the "obvious" 90-minute sleep cycle actually belong in the model?
+> 
+> **TL;DR:** I model overnight EEG alpha power with an ARIMA fit entirely by hand (no `auto_arima`). The physiologically obvious seasonal period (S = 180 ≈ 90 min) turns out to be wrong. It over-differences the series and has no ACF/PACF signature, so the final model is a non-seasonal **ARIMA(2,1,2)**, with the ultradian rhythm documented through spectral analysis instead.
 
 **Author:** Clark Enge (<clarkenge@ucsb.edu>)
 **Course:** PSTAT W 274 — Time Series Analysis
